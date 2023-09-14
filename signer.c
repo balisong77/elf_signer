@@ -1,17 +1,18 @@
 #include <elf.h>
 #include <err.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <openssl/cms.h>
 #include <openssl/engine.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-// #define SIG_SECTION_NAME ".signature"
 #define SIG_SECTION_NAME ".text_sig"
 #define TEXT_SECTION_NAME ".text"
 #define DYN_SECTION ".dynamic"
@@ -19,12 +20,17 @@
 #define SIG_TMP_FILE_NAME ".signature_tmp"
 #define HASH_ALGO "SHA256"
 
-#define _GNU_SOURCE
-
 /* Print error message. */
 #define ERROR(cond, fmt, ...)                                                  \
   if ((bool)(cond))                                                            \
-  err(1, fmt, ##__VA_ARGS__)
+    err(1, fmt, ##__VA_ARGS__)
+
+/* Print error message with given errno. */
+#define ERROR_ENO(cond, eno, fmt, ...)      \
+  if ((bool)(cond)){                        \
+    errno = eno;                            \
+    err(1, fmt, ##__VA_ARGS__);             \
+  }                                         \
 
 /* Read PEM encoded private key from file path. */
 static EVP_PKEY *read_private_key(const char *private_key_name) {
@@ -120,15 +126,17 @@ static unsigned long calculate_signature(void *data_buf, size_t data_len,
   return sig_len;
 }
 
-/* IO helpers. */
+/* Basic IO helpers. */
 static inline size_t read_file(FILE *file, void *buf, size_t size,
                                unsigned long long offset) {
   fseek(file, offset, SEEK_SET);
   return fread(buf, sizeof(char), size, file);
 }
 
+/* Copy <size> length bytes from src_file to dst_file. */
 void copy_bytes(FILE *src_file, FILE *dst_file, long long size) {
   char c;
+  /* When size == -1, copy the all the rest bytes in src_file to dst_file*/
   if (size == -1) {
     while ((c = fgetc(src_file)) != EOF) {
         fputc(c, dst_file);
@@ -145,114 +153,92 @@ void copy_bytes(FILE *src_file, FILE *dst_file, long long size) {
 /* ELF IO helpers. */
 static inline int check_elf_header(Elf64_Ehdr *elf_hdr) {
   if (memcmp(elf_hdr->e_ident, ELFMAG, SELFMAG) != 0) {
-    ERROR(1, "File is not an ELF file.");
-    return -1;
+    ERROR_ENO(1, EBADMSG, "File is not an ELF file.");
+    return 0;
   }
-
+  if (elf_hdr->e_ident[EI_CLASS] != ELFCLASS64) {
+    ERROR_ENO(1, EBADMSG, "Only support 64-bit ELF file.");
+    return 0;
+  }
   if (elf_hdr->e_ident[EI_VERSION] != EV_CURRENT){
-    ERROR(1, "ELF version not support.");
-    return -1;
+    ERROR_ENO(1, EBADMSG, "ELF version not support.");
+    return 0;
   }
 
   if (!elf_hdr->e_shoff) {
-    ERROR(1, "Section header table not found.");
-    return -1;
+    ERROR_ENO(1, EBADMSG, "Section header table not found.");
+    return 0;
   }
 
   if (elf_hdr->e_shentsize != sizeof(Elf64_Shdr)) {
-    ERROR(1, "Section header struct in wrong size.");
-    return -1;
+    ERROR_ENO(1, EBADMSG, "Section header struct in wrong size.");
+    return 0;
   }
 
-  return 0;
+  return 1;
 }
 
+/* Get ELF header from file. */
 static inline Elf64_Ehdr *read_elf_header(FILE *file) {
-  Elf64_Ehdr *elf_ex;
-  int retval;
+  Elf64_Ehdr *elf_header;
+  int is_valid;
 
-  elf_ex = malloc(sizeof(Elf64_Ehdr));
-  if (!elf_ex) {
-    warnx("kmalloc failed for elf_ex");
-    return NULL;
-  }
-  read_file(file, elf_ex, sizeof(Elf64_Ehdr), 0);
-  if (elf_ex->e_ident[EI_CLASS] != ELFCLASS64) {
-    ERROR(1, "Only support 64-bit ELF file.");
-  } else {
-    retval = check_elf_header(elf_ex);
-  }
-  if (retval) {
-    free(elf_ex);
-    return NULL;
-  }
+  elf_header = malloc(sizeof(Elf64_Ehdr));
+  ERROR(!elf_header,"Failed to malloc for elf_ex.");
 
-  return elf_ex;
+  read_file(file, elf_header, sizeof(Elf64_Ehdr), 0);
+
+  is_valid = check_elf_header(elf_header);
+  ERROR_ENO(!is_valid, EBADMSG, "ELF format is not valid.");
+
+  return elf_header;
 }
 
+/* Read the section header by given the offset. */
 Elf64_Shdr *read_shdr_at_offset(FILE *fp, unsigned long long offset) {
   Elf64_Shdr *shdr;
-  int retval;
-
   shdr = malloc(sizeof(Elf64_Shdr));
-  if (!shdr) {
-    warnx("Cannot allocate memory to read Section Header");
-    return NULL;
-  }
+  ERROR(!shdr, "Failed to allocate memory for shdr.");
 
-  retval = read_file(fp, shdr, sizeof(Elf64_Shdr), offset);
+  size_t read_size = read_file(fp, shdr, sizeof(Elf64_Shdr), offset);
+  ERROR(read_size != sizeof(Elf64_Shdr) || ferror(fp),"Read ELF file failed.");
 
-  if (ferror(fp) || (unsigned long)retval != sizeof(Elf64_Shdr)) {
-    warn("Cannot open elf file");
-    return NULL;
-  }
   return shdr;
 }
 
-Elf64_Shdr *read_shdr_at_ndx(FILE *fp, Elf64_Ehdr *elf_hdr, Elf64_Half shndx) {
-  return read_shdr_at_offset(fp, elf_hdr->e_shoff + shndx * sizeof(Elf64_Shdr));
+Elf64_Shdr *read_shdr_at_index(FILE *fp, Elf64_Ehdr *elf_hdr, Elf64_Half shdr_index) {
+  return read_shdr_at_offset(fp, elf_hdr->e_shoff + shdr_index * sizeof(Elf64_Shdr));
 }
 
-Elf64_Shdr *read_str_shdr(FILE *fp, Elf64_Ehdr *elf_hdr) {
-  return read_shdr_at_ndx(fp, elf_hdr, elf_hdr->e_shstrndx);
-}
-Elf64_Shdr *read_last_shdr(FILE *fp, Elf64_Ehdr *elf_hdr) {
-  return read_shdr_at_ndx(fp, elf_hdr, elf_hdr->e_shnum - 1);
-}
-
-void write_ehdr(FILE *file_out, Elf64_Ehdr *elf_hdr) {
-  fseek(file_out, 0, SEEK_SET);
-  fwrite(elf_hdr, sizeof(char), sizeof(Elf64_Ehdr), file_out);
-}
-
+/* Calculate the signature of .text section and write to tmp file. */
 int sign_file(FILE *elf_file, Elf64_Ehdr *elf_hdr, Elf64_Shdr *shstrtab_shdr,
               char *tmp_filename, char *filename, char *private_key_name,
               char *x509_name) {
   FILE *tmp_file, *signature_file;
-  int ret = EXIT_SUCCESS;
   char sig_name[] = SIG_SECTION_NAME;
   int sig_name_len = sizeof(sig_name);
   Elf64_Shdr *last_shdr;
   unsigned long sig_len;
 
   tmp_file = fopen(tmp_filename, "wb+");
-  ERROR(!tmp_file, "Cannot create tmp file %s", tmp_filename);
+  ERROR(!tmp_file, "Failed to create tmp file %s", tmp_filename);
 
   char *shstrtab = (char *)malloc(shstrtab_shdr->sh_size);
-  ERROR(!shstrtab, "Failed to malloc for string table");
+  ERROR(!shstrtab, "Failed to malloc for string table.");
   read_file(elf_file, shstrtab, shstrtab_shdr->sh_size,
             shstrtab_shdr->sh_offset);
 
   /* shdr_ptr: section header pointer. */
   Elf64_Shdr *shdr_ptr = malloc(sizeof(Elf64_Shdr));
+  ERROR(!shdr_ptr,"Failed to malloc for shdr_ptr.");
   for (int i = 0; i < elf_hdr->e_shnum; i++) {
     read_file(elf_file, shdr_ptr, sizeof(Elf64_Shdr),
               elf_hdr->e_shoff + sizeof(Elf64_Shdr) * i);
     char *section_name = shstrtab + shdr_ptr->sh_name;
-    /* calculate the signature of the .text section only*/
+    /* Find the .text section and calculate signature. */
     if (!memcmp(section_name, TEXT_SECTION_NAME, sizeof(TEXT_SECTION_NAME))) {
       char *section_data = (char *)malloc(shdr_ptr->sh_size);
-      ERROR(!section_data, "Failed to malloc for data of section %s",
+      ERROR(!section_data, "Failed to malloc for data of section %s.",
             section_name);
       read_file(elf_file, section_data, shdr_ptr->sh_size, shdr_ptr->sh_offset);
       sig_len = calculate_signature(section_data, shdr_ptr->sh_size,
@@ -262,52 +248,48 @@ int sign_file(FILE *elf_file, Elf64_Ehdr *elf_hdr, Elf64_Shdr *shstrtab_shdr,
     }
   }
 
-  last_shdr = read_last_shdr(elf_file, elf_hdr);
-  ERROR(!last_shdr, "Cannot alloc last_shdr memory [%s]", filename);
+  last_shdr = read_shdr_at_index(elf_file, elf_hdr, elf_hdr->e_shnum - 1);
+  ERROR(!last_shdr, "Failed to malloc for last_shdr.");
   signature_file = fopen(SIG_TMP_FILE_NAME, "rb");
   ERROR(!signature_file, "Cannot open tmp signature file");
 
   char *signature = malloc(sig_len);
   read_file(signature_file, signature, sig_len, 0);
 
-  /* copy bytes from 0 to .shstrtab section end*/
+  /* Copy bytes from 0 to .shstrtab section end. */
   fseek(tmp_file, 0, SEEK_SET);
   fseek(elf_file, 0, SEEK_SET);
   copy_bytes(elf_file, tmp_file,
              shstrtab_shdr->sh_offset + shstrtab_shdr->sh_size);
-  /* append signature section name to .shstrtab section*/
+  /* Append signature section name to .shstrtab section. */
   fwrite(sig_name, sizeof(char), sig_name_len, tmp_file);
-  /* copy bytes from .shstrtab section end to last section end (usually size =
-   * 0)*/
+  /* Copy bytes from .shstrtab section end to last section end (usually size = 0). */
   copy_bytes(elf_file, tmp_file,
              ((last_shdr->sh_offset + last_shdr->sh_size) -
               (shstrtab_shdr->sh_offset + shstrtab_shdr->sh_size)));
-  /* add signature section data */
+  /* Add signature section data */
   fwrite(signature, sizeof(char), sig_len, tmp_file);
-  /* copy bytes from last section end to section header table begin*/
+  /* Copy bytes from last section end to section header table begin. */
   copy_bytes(elf_file, tmp_file,
              elf_hdr->e_shoff - (last_shdr->sh_offset + last_shdr->sh_size));
-  /* copy section headers table begin to .shstrtab section header*/
+  /* Copy section headers table begin to .shstrtab section header*/
   copy_bytes(elf_file, tmp_file, sizeof(Elf64_Shdr) * elf_hdr->e_shstrndx);
-  /* change .shstrtab section size and write .shstrtab section header*/
+  /* Change .shstrtab section size and write .shstrtab section header. */
   shstrtab_shdr->sh_size += sig_name_len;
   fwrite(shstrtab_shdr, sizeof(char), sizeof(Elf64_Shdr), tmp_file);
-  /* move elf_file file ptr to sync with tmp_file */
+  /* Move elf_file file ptr to sync with tmp_file. */
   fseek(elf_file, sizeof(Elf64_Shdr), SEEK_CUR);
 
   /* Update sections which offset after .shstrtab section. */
   int i = elf_hdr->e_shstrndx;
-  memcpy(last_shdr, shstrtab_shdr,
-         sizeof(Elf64_Shdr)); // for offset calculate if i+1==elf_hdr->e_shnum
+  memcpy(last_shdr, shstrtab_shdr, sizeof(Elf64_Shdr)); 
   while (i + 1 < elf_hdr->e_shnum) {
     fread(last_shdr, sizeof(char), sizeof(Elf64_Shdr), elf_file);
     last_shdr->sh_offset += sig_name_len;
     fwrite(last_shdr, sizeof(char), sizeof(Elf64_Shdr), tmp_file);
     ++i;
   }
-  /**
-   * Fill in the section header entry for signature section.
-   */
+  /* Fill in the section header entry for signature section. */
   Elf64_Shdr *new_shdr = malloc(sizeof(Elf64_Shdr));
   memcpy(new_shdr, shstrtab_shdr, sizeof(Elf64_Shdr));
   new_shdr->sh_offset = last_shdr->sh_offset + last_shdr->sh_size;
@@ -320,77 +302,74 @@ int sign_file(FILE *elf_file, Elf64_Ehdr *elf_hdr, Elf64_Shdr *shstrtab_shdr,
   new_shdr->sh_info = 0;
   new_shdr->sh_link = 0;
   fwrite(new_shdr, sizeof(char), sizeof(Elf64_Shdr), tmp_file);
-  /* section headers table end */
+  /* Section headers table end */
 
   /* Copy bytes after section header table, normaly do nothing. */
   copy_bytes(elf_file, tmp_file, -1);
 
-  /* write elf header*/
+  /* Overwrite ELF header. */
   elf_hdr->e_shnum += 1;
   elf_hdr->e_shoff += (sig_name_len + sig_len);
-  write_ehdr(tmp_file, elf_hdr);
+  fseek(tmp_file, 0, SEEK_SET);
+  fwrite(elf_hdr, sizeof(char), sizeof(Elf64_Ehdr), tmp_file);
 
   free(shstrtab);
   free(shdr_ptr);
   free(signature);
   free(new_shdr);
+  fclose(tmp_file);
+  fclose(signature_file);
+  return sig_len;
 }
 
-int enter_sign(char *private_key_name, char *x509_name, char *elf_name,
-                char *dest_name) {
+/* Do some prepare work for signing. */
+int prepare_sign(char *private_key_name, char *x509_name, char *elf_name) {
+  int ret = EXIT_SUCCESS;
   FILE *elf_file;
-
   elf_file = fopen(elf_name, "rb");
-  ERROR(!elf_file, "Failed to open file:%s", elf_name);
+  ERROR(!elf_file, "Failed to open file [%s]", elf_name);
 
+  /* Get ELF header */
   Elf64_Ehdr *elf_hdr = read_elf_header(elf_file);
-  ERROR(!elf_hdr, "Failed to find ELF header:%s", elf_name);
-
-  Elf64_Shdr *shstrtab_shdr = read_str_shdr(elf_file, elf_hdr);
-  ERROR(!shstrtab_shdr, "Failed to find .shstrtab section:%s", elf_name);
+  ERROR(!elf_hdr, "Failed to find ELF header [%s]", elf_name);
+  /* Get .shstrtab section header */
+  Elf64_Shdr *shstrtab_shdr = read_shdr_at_index(elf_file, elf_hdr, elf_hdr->e_shstrndx);
+  ERROR(!shstrtab_shdr, "Failed to find .shstrtab section [%s]", elf_name);
 
   char *tmp_filename = malloc(strlen(elf_name) + 10);
-  ERROR(!tmp_filename, "Cannot alloc tmp_filename");
+  ERROR(!tmp_filename, "Failed to malloc for tmp_filename");
 
   strcpy(tmp_filename, elf_name);
   strcat(tmp_filename, ".signed");
 
-  /* Sign one file*/
-  sign_file(elf_file, elf_hdr, shstrtab_shdr, tmp_filename, elf_name,
+  /* Sign one file */
+  int sig_len = sign_file(elf_file, elf_hdr, shstrtab_shdr, tmp_filename, elf_name,
             private_key_name, x509_name);
-
+  /* Check sig size*/
+  ret = sig_len == 0 ? -1 : 0;
+  /* Copy file stat and remove tmp signature file*/
   struct stat elf_stat;
-  int ret = stat(elf_name, &elf_stat);
+  ret = stat(elf_name, &elf_stat);
   ret = chmod(tmp_filename, elf_stat.st_mode);
-  // ret = rename(tmp_filename, elf_name);
+  ret = remove(SIG_TMP_FILE_NAME);
 
-free_all:
   free(tmp_filename);
-free_shdr:
   free(shstrtab_shdr);
-free_ehdr:
   free(elf_hdr);
-close_file_in:
   fclose(elf_file);
   return ret;
 }
 
-/**
- * Printing the usage.
- */
-static __attribute__((noreturn)) void help(void) {
-  fprintf(stdout, "Usage: elf-sign <private_key_path> <x509_path> <elf_file> "
-                  "[<dest_file>]\n");
+/* Printing the usage */
+static __attribute__((noreturn)) void format(void) {
+  fprintf(stdout, "Usage:\n");
+  fprintf(stdout, "  elf_sign <private_key_path> <x509_path> <elf_file> \n");
   fprintf(stdout, "  -h,         display the help and exit\n");
-  fprintf(stdout, "\nSign the <elf-file> to an optional <dest-file> with\n");
-  fprintf(stdout,
-          "private key in <key> and public key certificate in <x509>\n");
-  fprintf(stdout,
-          "and the digest algorithm specified by <hash-algo>. If no \n");
-  fprintf(stdout,
-          "<dest-file> is specified, the <elf-file> will be backup to \n");
-  fprintf(stdout,
-          "<elf-file>.old, and the original <elf-file> will be signed.\n");
+  fprintf(stdout, "Description:\n");
+  fprintf(stdout, "  Sign the <elf-file> with PEM private key <private_key_path> \n");
+  fprintf(stdout, "  and public key certificate <x509>.\n");
+  fprintf(stdout, "  The signed file will be named <elf_file>.signed, \n");
+  fprintf(stdout, "  and the original <elf-file> will be remained.\n");
   exit(2);
 }
 
@@ -401,31 +380,28 @@ int main(int argc, char **argv) {
     opt = getopt(argc, argv, "h");
     switch (opt) {
     case 'h':
-      help();
+      format();
       break;
     case -1:
       break;
     default:
-      help();
+      format();
     }
   } while (opt != -1);
 
   argc -= optind;
   argv += optind;
-  if (argc < 3 || argc > 4) {
-    help();
+  if (argc != 3) {
+    format();
   }
-
-  /**
-   * @argv[0]: The file containing private key.
-   * @argv[1]: The file containing X.509.
-   * @argv[2]: The ELF file to be signed.
-   * @argv[3]: The destination file for storing signature. (optional)
-   */
+  
+  /* Get args from argv. */
   char *private_key_name = argv[0];
   char *x509_name = argv[1];
   char *elf_name = argv[2];
-  char *dest_name = argv[3];
 
-  enter_sign(private_key_name, x509_name, elf_name, dest_name);
+  int ret = prepare_sign(private_key_name, x509_name, elf_name);
+  if(!ret){
+    printf("%s signed successfully.\n", elf_name);
+  }
 }
